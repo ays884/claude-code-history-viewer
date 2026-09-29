@@ -168,7 +168,13 @@ pub async fn stop_file_watcher(app_handle: AppHandle) -> Result<(), String> {
 /// extracted.  This is the shared core used by both the Tauri desktop watcher
 /// and the `WebUI` SSE server watcher.
 pub fn to_file_watch_event(event: &DebouncedEvent) -> Option<FileWatchEvent> {
-    let path = &event.path;
+    // Event paths are joined onto the watched root, and the desktop watcher
+    // watches a canonicalized root, which on Windows carries the `\\?\`
+    // prefix. Every other path the frontend holds (session `file_path`,
+    // project `path`) comes without it, so its strict equality checks never
+    // matched and live refresh silently did nothing on Windows.
+    let path = strip_windows_extended_prefix(&event.path);
+    let path = path.as_path();
     let (project_path, session_path) = extract_provider_paths(path)?;
 
     if !record_content_signature_change(path) {
@@ -186,6 +192,19 @@ pub fn to_file_watch_event(event: &DebouncedEvent) -> Option<FileWatchEvent> {
         session_path,
         event_type: event_type.to_string(),
     })
+}
+
+/// Remove the extended-length prefix that Windows `canonicalize()` adds.
+/// Cross-platform so the rule can be unit-tested on any host.
+fn strip_windows_extended_prefix(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
 }
 
 /// Seed the file signature cache for a watched tree.
@@ -711,6 +730,60 @@ mod tests {
         let result = extract_paths(&path);
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_strip_windows_extended_prefix() {
+        assert_eq!(
+            strip_windows_extended_prefix(Path::new(r"\\?\C:\Users\a\.claude\projects\p\s.jsonl")),
+            PathBuf::from(r"C:\Users\a\.claude\projects\p\s.jsonl")
+        );
+        assert_eq!(
+            strip_windows_extended_prefix(Path::new(r"\\?\UNC\server\share\p\s.jsonl")),
+            PathBuf::from(r"\\server\share\p\s.jsonl")
+        );
+        assert_eq!(
+            strip_windows_extended_prefix(Path::new("/home/a/.claude/projects/p/s.jsonl")),
+            PathBuf::from("/home/a/.claude/projects/p/s.jsonl")
+        );
+    }
+
+    /// The desktop watcher watches a canonicalized root, so on Windows its
+    /// events arrive as `\\?\C:\...`. The emitted paths must match the plain
+    /// form the frontend compares against.
+    #[cfg(windows)]
+    #[test]
+    fn test_to_file_watch_event_emits_paths_without_extended_prefix() {
+        let temp = TempDir::new().unwrap();
+        std::env::set_var("CCHV_TEST_HOME", temp.path());
+        let project_dir = temp
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("my-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let session_path = project_dir.join("session.jsonl");
+        std::fs::write(&session_path, "{}\n").unwrap();
+
+        let canonical = session_path.canonicalize().unwrap();
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+
+        let event = to_file_watch_event(&DebouncedEvent {
+            path: canonical,
+            kind: DebouncedEventKind::Any,
+        })
+        .expect("a changed session file should produce an event");
+        assert!(
+            !event.session_path.starts_with(r"\\?\"),
+            "{}",
+            event.session_path
+        );
+        assert!(
+            !event.project_path.starts_with(r"\\?\"),
+            "{}",
+            event.project_path
+        );
+        assert!(event.session_path.ends_with(r"my-project\session.jsonl"));
     }
 
     #[test]
