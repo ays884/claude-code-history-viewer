@@ -70,6 +70,38 @@ describe("useExternalLinks", () => {
     unmount();
   });
 
+  it.each(["src/App.tsx#L42", "./README.md", "/etc/hosts", "file:///C:/repo/a.ts"])(
+    "blocks in-app navigation for non-external link %s",
+    (href) => {
+      const { unmount } = renderHook(() => useExternalLinks());
+      const anchor = document.createElement("a");
+      anchor.setAttribute("href", href);
+      document.body.appendChild(anchor);
+
+      const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+      anchor.dispatchEvent(event);
+
+      expect(event.defaultPrevented).toBe(true);
+      expect(openExternalUrl).not.toHaveBeenCalled();
+      unmount();
+    }
+  );
+
+  it("does not block programmatic blob downloads", () => {
+    const { unmount } = renderHook(() => useExternalLinks());
+    const anchor = document.createElement("a");
+    anchor.setAttribute("href", "blob:tauri://localhost/1234");
+    anchor.download = "export.json";
+    document.body.appendChild(anchor);
+
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    anchor.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(openExternalUrl).not.toHaveBeenCalled();
+    unmount();
+  });
+
   it("does not intercept modified clicks", () => {
     const { unmount } = renderHook(() => useExternalLinks());
     const anchor = document.createElement("a");
