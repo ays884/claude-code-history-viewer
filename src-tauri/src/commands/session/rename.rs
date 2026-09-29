@@ -187,11 +187,12 @@ fn write_jsonl_lines(file_path: &str, lines: &[String]) -> Result<(), String> {
         let mut temp_file = File::create(&temp_path)
             .map_err(|e| RenameError::IoError(e.to_string()).to_string())?;
 
-        for (i, line) in lines.iter().enumerate() {
-            if i > 0 {
-                writeln!(temp_file).map_err(|e| RenameError::IoError(e.to_string()).to_string())?;
-            }
-            write!(temp_file, "{line}")
+        // Terminate every line, including the last: Claude Code appends
+        // `JSON.stringify(entry) + "\n"` without a leading newline, so a file
+        // left unterminated here would get its next entry glued onto our last
+        // line, making both unparseable.
+        for line in lines {
+            writeln!(temp_file, "{line}")
                 .map_err(|e| RenameError::IoError(e.to_string()).to_string())?;
         }
     }
@@ -1102,6 +1103,11 @@ mod tests {
         assert_eq!(result.new_title, "My [Project] v2");
 
         let updated = fs::read_to_string(&file_path).unwrap();
+        // A later append by Claude Code must start on a fresh line.
+        assert!(
+            updated.ends_with('\n'),
+            "rewritten JSONL must end with a newline"
+        );
         let lines: Vec<&str> = updated.lines().collect();
         // Original 2 messages + legacy rename event + modern custom-title event.
         assert_eq!(lines.len(), 4);
