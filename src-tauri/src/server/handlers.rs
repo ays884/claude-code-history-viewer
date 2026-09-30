@@ -13,6 +13,39 @@ use std::sync::Arc;
 use super::state::AppState;
 use crate::commands;
 
+// ─── History-root guard ───────────────────────────────────────────────────────
+
+/// Caller-supplied session / project paths must sit under a configured history
+/// root. Applied here, at the HTTP trust boundary, rather than in the commands,
+/// which desktop also calls with paths from its own scans and folder picker.
+fn require_history_path(path: &str) -> Result<(), String> {
+    commands::session::is_safe_session_path(std::path::Path::new(path))
+}
+
+/// A Claude base directory (`~/.claude`-shaped) is accepted when its
+/// `projects/` folder is a history root. Empty means "use the default".
+fn require_claude_base(base: &str) -> Result<(), String> {
+    if base.is_empty() {
+        return Ok(());
+    }
+    require_history_path(
+        &std::path::Path::new(base)
+            .join("projects")
+            .to_string_lossy(),
+    )
+}
+
+fn require_claude_bases(
+    base: Option<&str>,
+    custom: Option<&[commands::multi_provider::CustomClaudePathParam]>,
+) -> Result<(), String> {
+    require_claude_base(base.unwrap_or_default())?;
+    custom
+        .unwrap_or_default()
+        .iter()
+        .try_for_each(|c| require_claude_base(&c.path))
+}
+
 // ─── Error type ───────────────────────────────────────────────────────────────
 
 /// Unified error response for API endpoints.
@@ -500,7 +533,10 @@ handler_json!(
 handler_json!(
     scan_projects,
     ClaudePathParam,
-    |p: ClaudePathParam| async move { commands::project::scan_projects(p.claude_path).await }
+    |p: ClaudePathParam| async move {
+        require_claude_base(&p.claude_path)?;
+        commands::project::scan_projects(p.claude_path).await
+    }
 );
 
 handler_json!(get_git_log, GitLogParams, |p: GitLogParams| async move {
@@ -511,6 +547,7 @@ handler_json!(
     load_project_sessions,
     LoadProjectSessionsParams,
     |p: LoadProjectSessionsParams| async move {
+        require_history_path(&p.project_path)?;
         commands::session::load_project_sessions(p.project_path, p.exclude_sidechain).await
     }
 );
@@ -519,6 +556,7 @@ handler_json!(
     load_project_sessions_page,
     LoadProjectSessionsPageParams,
     |p: LoadProjectSessionsPageParams| async move {
+        require_history_path(&p.project_path)?;
         commands::session::load_project_sessions_page(
             p.project_path,
             p.exclude_sidechain,
@@ -532,13 +570,17 @@ handler_json!(
 handler_json!(
     load_session_messages,
     SessionPathParam,
-    |p: SessionPathParam| async move { commands::session::load_session_messages(p.session_path).await }
+    |p: SessionPathParam| async move {
+        require_history_path(&p.session_path)?;
+        commands::session::load_session_messages(p.session_path).await
+    }
 );
 
 handler_json!(
     load_session_messages_paginated,
     PaginatedParams,
     |p: PaginatedParams| async move {
+        require_history_path(&p.session_path)?;
         commands::session::load_session_messages_paginated(
             p.session_path,
             p.offset,
@@ -553,6 +595,7 @@ handler_json!(
     get_session_message_count,
     MessageCountParams,
     |p: MessageCountParams| async move {
+        require_history_path(&p.session_path)?;
         commands::session::get_session_message_count(p.session_path, p.exclude_sidechain).await
     }
 );
@@ -561,7 +604,7 @@ handler_json!(
     get_session_subagents,
     SessionPathParam,
     |p: SessionPathParam| async move {
-        commands::session::is_safe_session_path(&PathBuf::from(&p.session_path))?;
+        require_history_path(&p.session_path)?;
         commands::session::get_session_subagents(p.session_path).await
     }
 );
@@ -570,6 +613,7 @@ handler_json!(
     search_messages,
     SearchParams,
     |p: SearchParams| async move {
+        require_claude_base(&p.claude_path)?;
         commands::session::search_messages(p.claude_path, p.query, p.filters, p.limit).await
     }
 );
@@ -578,6 +622,10 @@ handler_json!(
     get_recent_edits,
     RecentEditsParams,
     |p: RecentEditsParams| async move {
+        require_history_path(&p.project_path)?;
+        if let Some(session) = &p.session_file_path {
+            require_history_path(session)?;
+        }
         commands::session::get_recent_edits(
             p.project_path,
             p.offset,
@@ -607,6 +655,11 @@ handler_json!(
     restore_file,
     RestoreFileParams,
     |p: RestoreFileParams| async move {
+        // The edit history that authorises the write must itself be history.
+        require_history_path(&p.project_path)?;
+        if let Some(session) = &p.session_file_path {
+            require_history_path(session)?;
+        }
         commands::session::restore_file(p.file_path, p.content, p.project_path, p.session_file_path)
             .await
     }
@@ -672,7 +725,7 @@ handler_json!(
         // ForgeCode uses opaque URI scheme handled inside the command;
         // file-path callers are constrained to the provider session roots.
         if !p.file_path.starts_with("forgecode://") && !p.file_path.starts_with("forgecode-db://") {
-            commands::session::is_safe_session_path(&PathBuf::from(&p.file_path))?;
+            require_history_path(&p.file_path)?;
         }
         commands::session::delete_session(p.file_path).await
     }
@@ -683,7 +736,7 @@ handler_json!(
     RenameSessionParams,
     |p: RenameSessionParams| async move {
         if !p.file_path.starts_with("forgecode://") && !p.file_path.starts_with("forgecode-db://") {
-            commands::session::is_safe_session_path(&PathBuf::from(&p.file_path))?;
+            require_history_path(&p.file_path)?;
         }
         commands::session::rename_session_native(p.file_path, p.new_title).await
     }
@@ -694,7 +747,7 @@ handler_json!(
     PathParam,
     |p: PathParam| async move {
         if !p.path.starts_with("forgecode://") && !p.path.starts_with("forgecode-db://") {
-            commands::session::is_safe_session_path(&PathBuf::from(&p.path))?;
+            require_history_path(&p.path)?;
         }
         commands::session::reset_session_native_name(p.path).await
     }
@@ -704,7 +757,7 @@ handler_json!(
     rename_opencode_session_title,
     RenameOpenCodeParams,
     |p: RenameOpenCodeParams| async move {
-        commands::session::is_safe_session_path(&PathBuf::from(&p.session_path))?;
+        require_history_path(&p.session_path)?;
         commands::session::rename_opencode_session_title(p.session_path, p.new_title).await
     }
 );
@@ -771,6 +824,9 @@ handler_json!(
     get_session_token_stats,
     SessionTokenStatsParams,
     |p: SessionTokenStatsParams| async move {
+        if commands::stats::is_claude_session_path(&p.session_path) {
+            require_history_path(&p.session_path)?;
+        }
         commands::stats::get_session_token_stats(
             p.session_path,
             p.start_date,
@@ -785,6 +841,9 @@ handler_json!(
     get_project_token_stats,
     ProjectTokenStatsParams,
     |p: ProjectTokenStatsParams| async move {
+        if commands::stats::is_claude_project_path(&p.project_path) {
+            require_history_path(&p.project_path)?;
+        }
         commands::stats::get_project_token_stats(
             p.project_path,
             p.offset,
@@ -801,6 +860,9 @@ handler_json!(
     get_project_stats_summary,
     ProjectStatsSummaryParams,
     |p: ProjectStatsSummaryParams| async move {
+        if commands::stats::is_claude_project_path(&p.project_path) {
+            require_history_path(&p.project_path)?;
+        }
         commands::stats::get_project_stats_summary(
             p.project_path,
             p.start_date,
@@ -815,6 +877,9 @@ handler_json!(
     get_session_comparison,
     SessionComparisonParams,
     |p: SessionComparisonParams| async move {
+        if commands::stats::is_claude_project_path(&p.project_path) {
+            require_history_path(&p.project_path)?;
+        }
         commands::stats::get_session_comparison(
             p.session_id,
             p.project_path,
@@ -830,6 +895,7 @@ handler_json!(
     get_global_stats_summary,
     GlobalStatsParams,
     |p: GlobalStatsParams| async move {
+        require_claude_bases(p.claude_path.as_deref(), p.custom_claude_paths.as_deref())?;
         commands::stats::get_global_stats_summary(
             p.claude_path.unwrap_or_default(),
             p.active_providers,
@@ -896,6 +962,7 @@ handler_json!(
     scan_all_projects,
     ScanAllProjectsParams,
     |p: ScanAllProjectsParams| async move {
+        require_claude_bases(p.claude_path.as_deref(), p.custom_claude_paths.as_deref())?;
         commands::multi_provider::scan_all_projects(
             p.claude_path,
             p.active_providers,
@@ -911,6 +978,9 @@ handler_json!(
     load_provider_sessions,
     ProviderSessionsParams,
     |p: ProviderSessionsParams| async move {
+        if p.provider == "claude" {
+            require_history_path(&p.project_path)?;
+        }
         commands::multi_provider::load_provider_sessions(
             p.provider,
             p.project_path,
@@ -924,6 +994,9 @@ handler_json!(
     load_provider_sessions_page,
     ProviderSessionsPageParams,
     |p: ProviderSessionsPageParams| async move {
+        if p.provider == "claude" {
+            require_history_path(&p.project_path)?;
+        }
         commands::multi_provider::load_provider_sessions_page(
             p.provider,
             p.project_path,
@@ -939,6 +1012,9 @@ handler_json!(
     load_provider_session_by_path,
     ProviderSessionByPathParams,
     |p: ProviderSessionByPathParams| async move {
+        if p.provider == "claude" {
+            require_history_path(&p.project_path)?;
+        }
         commands::multi_provider::load_provider_session_by_path(
             p.provider,
             p.project_path,
@@ -953,6 +1029,9 @@ handler_json!(
     load_provider_messages,
     ProviderMessagesParams,
     |p: ProviderMessagesParams| async move {
+        if p.provider == "claude" {
+            require_history_path(&p.session_path)?;
+        }
         commands::multi_provider::load_provider_messages(p.provider, p.session_path).await
     }
 );
@@ -961,6 +1040,9 @@ handler_json!(
     load_provider_messages_paginated,
     ProviderMessagesPaginatedParams,
     |p: ProviderMessagesPaginatedParams| async move {
+        if p.provider == "claude" {
+            require_history_path(&p.session_path)?;
+        }
         commands::multi_provider::load_provider_messages_paginated(
             p.provider,
             p.session_path,
@@ -976,6 +1058,9 @@ handler_json!(
     get_provider_message_offset,
     ProviderMessageOffsetParams,
     |p: ProviderMessageOffsetParams| async move {
+        if p.provider == "claude" {
+            require_history_path(&p.session_path)?;
+        }
         commands::multi_provider::get_provider_message_offset(
             p.provider,
             p.session_path,
@@ -990,6 +1075,7 @@ handler_json!(
     search_all_providers,
     SearchAllProvidersParams,
     |p: SearchAllProvidersParams| async move {
+        require_claude_bases(p.claude_path.as_deref(), p.custom_claude_paths.as_deref())?;
         commands::multi_provider::search_all_providers(
             p.claude_path,
             p.query,
@@ -1053,6 +1139,57 @@ pub async fn load_user_metadata(
     })?))
 }
 
+/// Persist metadata written through the `WebUI`.
+///
+/// Custom Claude directories widen the history roots every path check allows,
+/// so over the `WebUI` they are server configuration (desktop app,
+/// `CLAUDE_CONFIG_DIR`, or `user-data.json` on the host): the list already on
+/// disk is kept and any incoming value is ignored, while every other field
+/// saves normally; the one entry accepted is the host's own `CLAUDE_CONFIG_DIR`.
+/// Ignoring rather than rejecting keeps the frontend, which
+/// always sends the full settings object, able to save everything else. The
+/// cache is updated to what was actually written.
+async fn save_webui_metadata(
+    state: &AppState,
+    mut metadata: crate::models::UserMetadata,
+) -> Result<crate::models::UserMetadata, ApiError> {
+    let saved = tokio::task::spawn_blocking(move || {
+        let incoming = std::mem::take(&mut metadata.settings.custom_claude_paths);
+        let mut kept = commands::metadata::get_user_data_path()
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|content| serde_json::from_str::<crate::models::UserMetadata>(&content).ok())
+            .map(|persisted| persisted.settings.custom_claude_paths)
+            .unwrap_or_default();
+        // `CLAUDE_CONFIG_DIR` is set on the host, so the frontend recording it
+        // (it registers the detected value automatically) adds no new root.
+        let same =
+            |a: &str, b: &str| a.trim_end_matches(['/', '\\']) == b.trim_end_matches(['/', '\\']);
+        if let Some(config_dir) = commands::project::claude_config_dir() {
+            if !kept.iter().any(|c| same(&c.path, &config_dir)) {
+                kept.extend(
+                    incoming
+                        .into_iter()
+                        .filter(|c| same(&c.path, &config_dir))
+                        .take(1),
+                );
+            }
+        }
+        metadata.settings.custom_claude_paths = kept;
+        commands::metadata::save_metadata_to_disk(&metadata).map(|()| metadata)
+    })
+    .await
+    .map_err(|e| ApiError(format!("Task join error: {e}")))??;
+
+    let mut cached = state
+        .metadata
+        .metadata
+        .lock()
+        .map_err(|e| ApiError(format!("Lock error: {e}")))?;
+    *cached = Some(saved.clone());
+    Ok(saved)
+}
+
 #[derive(Deserialize)]
 pub struct SaveUserMetadataParams {
     pub metadata: crate::models::UserMetadata,
@@ -1062,18 +1199,7 @@ pub async fn save_user_metadata(
     State(state): State<Arc<AppState>>,
     Json(p): Json<SaveUserMetadataParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let metadata = p.metadata;
-    let meta_clone = metadata.clone();
-    tokio::task::spawn_blocking(move || commands::metadata::save_metadata_to_disk(&meta_clone))
-        .await
-        .map_err(|e| ApiError(format!("Task join error: {e}")))??;
-
-    let mut cached = state
-        .metadata
-        .metadata
-        .lock()
-        .map_err(|e| ApiError(format!("Lock error: {e}")))?;
-    *cached = Some(metadata);
+    save_webui_metadata(&state, p.metadata).await?;
     Ok(Json(Value::Null))
 }
 
@@ -1096,10 +1222,7 @@ pub async fn update_session_metadata(
         metadata.clone()
     };
 
-    let meta_clone = metadata_to_save.clone();
-    tokio::task::spawn_blocking(move || commands::metadata::save_metadata_to_disk(&meta_clone))
-        .await
-        .map_err(|e| ApiError(format!("Task join error: {e}")))??;
+    let metadata_to_save = save_webui_metadata(&state, metadata_to_save).await?;
 
     Ok(Json(serde_json::to_value(metadata_to_save).map_err(
         |e| ApiError(format!("Serialization error: {e}")),
@@ -1127,10 +1250,7 @@ pub async fn update_project_metadata(
         metadata.clone()
     };
 
-    let meta_clone = metadata_to_save.clone();
-    tokio::task::spawn_blocking(move || commands::metadata::save_metadata_to_disk(&meta_clone))
-        .await
-        .map_err(|e| ApiError(format!("Task join error: {e}")))??;
+    let metadata_to_save = save_webui_metadata(&state, metadata_to_save).await?;
 
     Ok(Json(serde_json::to_value(metadata_to_save).map_err(
         |e| ApiError(format!("Serialization error: {e}")),
@@ -1158,10 +1278,7 @@ pub async fn update_user_settings(
         metadata.clone()
     };
 
-    let meta_clone = metadata_to_save.clone();
-    tokio::task::spawn_blocking(move || commands::metadata::save_metadata_to_disk(&meta_clone))
-        .await
-        .map_err(|e| ApiError(format!("Task join error: {e}")))??;
+    let metadata_to_save = save_webui_metadata(&state, metadata_to_save).await?;
 
     Ok(Json(serde_json::to_value(metadata_to_save).map_err(
         |e| ApiError(format!("Serialization error: {e}")),
@@ -1256,6 +1373,10 @@ handler_json!(
     create_archive,
     CreateArchiveParams,
     |p: CreateArchiveParams| async move {
+        require_history_path(&p.source_project_path)?;
+        p.session_file_paths
+            .iter()
+            .try_for_each(|path| require_history_path(path))?;
         commands::archive::create_archive(
             p.name,
             p.description,
@@ -1329,6 +1450,7 @@ handler_json!(
     get_expiring_sessions,
     ExpiringSessionsParams,
     |p: ExpiringSessionsParams| async move {
+        require_history_path(&p.project_path)?;
         commands::archive::get_expiring_sessions(p.project_path, p.threshold_days.unwrap_or(7))
             .await
     }
@@ -1345,6 +1467,265 @@ handler_json!(
     export_session,
     ExportSessionParams,
     |p: ExportSessionParams| async move {
+        require_history_path(&p.session_file_path)?;
         commands::archive::export_session(p.session_file_path, p.format).await
     }
 );
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn outside_project() -> (tempfile::TempDir, String) {
+        let outside = tempfile::tempdir().unwrap();
+        let project = outside.path().join("projects").join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("session.jsonl"), "{}\n").unwrap();
+        let path = project.to_string_lossy().to_string();
+        (outside, path)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provider_sessions_page_rejects_project_outside_history_roots() {
+        let _home = crate::test_utils::SandboxHome::new();
+        let (_outside, project_path) = outside_project();
+
+        let res = load_provider_sessions_page(Json(ProviderSessionsPageParams {
+            provider: "claude".to_string(),
+            project_path,
+            exclude_sidechain: None,
+            offset: None,
+            limit: None,
+        }))
+        .await;
+
+        assert!(res.is_err(), "out-of-root project was served");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn session_messages_rejects_file_outside_history_roots() {
+        let _home = crate::test_utils::SandboxHome::new();
+        let (_outside, project_path) = outside_project();
+        let session_path = format!("{project_path}/session.jsonl");
+
+        let res = load_session_messages(Json(SessionPathParam { session_path })).await;
+
+        assert!(res.is_err(), "out-of-root session file was served");
+    }
+
+    fn metadata_state() -> Arc<AppState> {
+        let (event_tx, _rx) =
+            tokio::sync::broadcast::channel::<crate::commands::watcher::FileWatchEvent>(1);
+        Arc::new(AppState {
+            metadata: Arc::new(commands::metadata::MetadataState::default()),
+            start_time: std::time::Instant::now(),
+            auth: crate::server::auth::AuthState::Disabled,
+            read_only: false,
+            loopback_bind: false,
+            event_tx,
+        })
+    }
+
+    fn persisted_metadata() -> crate::models::UserMetadata {
+        let path = commands::metadata::get_user_data_path().unwrap();
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn custom_path(path: &std::path::Path) -> crate::models::CustomClaudePath {
+        crate::models::CustomClaudePath {
+            path: path.to_string_lossy().to_string(),
+            label: None,
+        }
+    }
+
+    /// Custom Claude directories are server configuration: saving through the
+    /// `WebUI` keeps the persisted list and still saves every other field.
+    #[tokio::test]
+    #[serial]
+    async fn webui_metadata_saves_keep_persisted_custom_claude_paths() {
+        let home = crate::test_utils::SandboxHome::new();
+        let configured = home.path().join("configured-claude");
+        let mut initial = crate::models::UserMetadata::new();
+        initial.settings.custom_claude_paths = vec![custom_path(&configured)];
+        commands::metadata::save_metadata_to_disk(&initial).unwrap();
+        let state = metadata_state();
+        let injected = home.path().join("injected");
+
+        let mut metadata = initial.clone();
+        metadata.settings.custom_claude_paths = vec![custom_path(&injected)];
+        metadata.settings.hidden_patterns = vec!["tmp-*".to_string()];
+        let _ = save_user_metadata(
+            State(Arc::clone(&state)),
+            Json(SaveUserMetadataParams { metadata }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("save_user_metadata failed"));
+        let saved = persisted_metadata();
+        assert_eq!(
+            saved.settings.custom_claude_paths,
+            initial.settings.custom_claude_paths
+        );
+        assert_eq!(saved.settings.hidden_patterns, vec!["tmp-*".to_string()]);
+
+        let mut settings = saved.settings.clone();
+        settings.custom_claude_paths = Vec::new();
+        settings.hidden_patterns = vec!["other-*".to_string()];
+        let _ = update_user_settings(
+            State(Arc::clone(&state)),
+            Json(UpdateUserSettingsParams { settings }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("update_user_settings failed"));
+        let saved = persisted_metadata();
+        assert_eq!(
+            saved.settings.custom_claude_paths,
+            initial.settings.custom_claude_paths
+        );
+        assert_eq!(saved.settings.hidden_patterns, vec!["other-*".to_string()]);
+    }
+
+    /// `CLAUDE_CONFIG_DIR` is already server configuration, so the frontend's
+    /// automatic registration of it still persists; nothing else is added.
+    #[tokio::test]
+    #[serial]
+    async fn webui_metadata_saves_accept_the_claude_config_dir_entry() {
+        let home = crate::test_utils::SandboxHome::new();
+        let config_dir = home.path().join("config-claude");
+        std::fs::create_dir_all(config_dir.join("projects")).unwrap();
+        let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config_dir);
+        commands::metadata::save_metadata_to_disk(&crate::models::UserMetadata::new()).unwrap();
+
+        let mut settings = crate::models::UserSettings::default();
+        settings.custom_claude_paths = vec![
+            crate::models::CustomClaudePath {
+                path: config_dir.to_string_lossy().to_string(),
+                label: Some("CLAUDE_CONFIG_DIR".to_string()),
+            },
+            custom_path(&home.path().join("injected")),
+        ];
+        let res = update_user_settings(
+            State(metadata_state()),
+            Json(UpdateUserSettingsParams { settings }),
+        )
+        .await;
+
+        match previous {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        assert!(res.is_ok(), "update_user_settings failed");
+        let saved = persisted_metadata().settings.custom_claude_paths;
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!(saved[0].path, config_dir.to_string_lossy());
+    }
+
+    /// Path-bearing provider ids pass the history-root check as ids, so the
+    /// provider loader itself must confine them.
+    #[tokio::test]
+    #[serial]
+    async fn provider_messages_rejects_path_bearing_ids_outside_their_roots() {
+        let _home = crate::test_utils::SandboxHome::new();
+        let outside = tempfile::tempdir().unwrap();
+
+        let aider_dir = outside.path().join("proj");
+        std::fs::create_dir_all(&aider_dir).unwrap();
+        let history = aider_dir.join(".aider.chat.history.md");
+        std::fs::write(
+            &history,
+            "# aider chat started at 2025-03-26 14:32:01\n\n#### hello\n\nhi there\n",
+        )
+        .unwrap();
+
+        let cline_base = outside.path().join("saoudrizwan.claude-dev");
+        let task = cline_base.join("tasks").join("1700000000000");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(
+            task.join("ui_messages.json"),
+            r#"[{"type":"say","say":"text","text":"hello","ts":1700000000000}]"#,
+        )
+        .unwrap();
+
+        for (provider, session_path) in [
+            ("aider", format!("aider://{}#0", history.display())),
+            (
+                "cline",
+                format!("cline://{}:1700000000000", cline_base.display()),
+            ),
+        ] {
+            let res = load_provider_messages(Json(ProviderMessagesParams {
+                provider: provider.to_string(),
+                session_path,
+            }))
+            .await;
+            assert!(res.is_err(), "{provider} served a path outside its roots");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn session_by_path_rejects_project_outside_history_roots() {
+        let _home = crate::test_utils::SandboxHome::new();
+        let (_outside, project_path) = outside_project();
+        let file_path = format!("{project_path}/session.jsonl");
+
+        let res = load_provider_session_by_path(Json(ProviderSessionByPathParams {
+            provider: "claude".to_string(),
+            project_path,
+            file_path,
+            exclude_sidechain: None,
+        }))
+        .await;
+
+        let Err(ApiError(message)) = res else {
+            panic!("out-of-root project was served");
+        };
+        assert_eq!(message, commands::session::OUTSIDE_HISTORY_ROOTS);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn session_by_path_serves_default_claude_project() {
+        let home = crate::test_utils::SandboxHome::new();
+        let project = home.path().join(".claude").join("projects").join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let file = project.join("session.jsonl");
+        std::fs::write(
+            &file,
+            "{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"s1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+
+        let res = load_provider_session_by_path(Json(ProviderSessionByPathParams {
+            provider: "claude".to_string(),
+            project_path: project.to_string_lossy().to_string(),
+            file_path: file.to_string_lossy().to_string(),
+            exclude_sidechain: None,
+        }))
+        .await;
+
+        assert!(res.is_ok(), "in-root session was rejected");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provider_sessions_page_serves_default_claude_project() {
+        let home = crate::test_utils::SandboxHome::new();
+        let project = home.path().join(".claude").join("projects").join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let res = load_provider_sessions_page(Json(ProviderSessionsPageParams {
+            provider: "claude".to_string(),
+            project_path: project.to_string_lossy().to_string(),
+            exclude_sidechain: None,
+            offset: None,
+            limit: None,
+        }))
+        .await;
+
+        assert!(res.is_ok(), "in-root project was rejected");
+    }
+}
