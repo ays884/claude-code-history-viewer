@@ -207,6 +207,28 @@ fn write_settings_file(path: &Path, content: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Read an existing JSON config that is about to be updated in place.
+///
+/// A missing or empty file is treated as `{}`. A file that exists but does
+/// not parse is an error: the caller writes the whole object back, so
+/// falling back to `{}` would replace e.g. every key of `~/.claude.json`
+/// (account, per-project state, ...) with just the field being saved. A
+/// transient partial write by a running Claude Code, a hand edit with a
+/// trailing comma, or a BOM from a Windows editor is enough to trigger that.
+fn read_json_for_update(path: &Path) -> Result<serde_json::Value, String> {
+    let content = read_settings_file(path)?;
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    if content.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(content).map_err(|e| {
+        format!(
+            "Refusing to overwrite {}: it is not valid JSON ({e}). Fix or remove the file and try again.",
+            path.display()
+        )
+    })
+}
+
 /// Get settings for a specific scope
 ///
 /// # Arguments
@@ -457,12 +479,7 @@ pub async fn save_mcp_servers(
             "user_settings" => {
                 // Update mcpServers field in ~/.claude/settings.json (legacy)
                 let path = get_user_settings_path()?;
-                let mut settings: serde_json::Value = if path.exists() {
-                    let content = read_settings_file(&path)?;
-                    serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
-                } else {
-                    serde_json::json!({})
-                };
+                let mut settings = read_json_for_update(&path)?;
 
                 settings["mcpServers"] = servers_value;
                 let content = serde_json::to_string_pretty(&settings)
@@ -491,12 +508,7 @@ pub async fn save_mcp_servers(
             "user_claude_json" => {
                 // Update mcpServers field in ~/.claude.json (official)
                 let path = get_claude_json_path()?;
-                let mut claude_json: serde_json::Value = if path.exists() {
-                    let content = read_settings_file(&path)?;
-                    serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
-                } else {
-                    serde_json::json!({})
-                };
+                let mut claude_json = read_json_for_update(&path)?;
 
                 claude_json["mcpServers"] = servers_value;
                 let content = serde_json::to_string_pretty(&claude_json)
@@ -508,12 +520,7 @@ pub async fn save_mcp_servers(
                 let pp =
                     project_path.ok_or("project_path required for local_claude_json source")?;
                 let path = get_claude_json_path()?;
-                let mut claude_json: serde_json::Value = if path.exists() {
-                    let content = read_settings_file(&path)?;
-                    serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
-                } else {
-                    serde_json::json!({})
-                };
+                let mut claude_json = read_json_for_update(&path)?;
 
                 // Ensure projects object exists
                 if claude_json.get("projects").is_none() {
@@ -1049,6 +1056,83 @@ mod tests {
         assert_eq!(servers.len(), 1);
         assert_eq!(servers["server1"]["priority"], "high");
 
+        drop(temp);
+    }
+
+    #[tokio::test]
+    async fn test_save_mcp_servers_merges_into_existing_claude_json() {
+        let temp = setup_test_env();
+        let path = temp.path().join(".claude.json");
+        fs::write(&path, r#"{"oauthAccount":{"id":"a"},"projects":{}}"#).unwrap();
+
+        save_mcp_servers(
+            "user_claude_json".to_string(),
+            r#"{"s":{"command":"c"}}"#.to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["oauthAccount"]["id"], "a");
+        assert_eq!(saved["mcpServers"]["s"]["command"], "c");
+        drop(temp);
+    }
+
+    #[tokio::test]
+    async fn test_save_mcp_servers_refuses_to_clobber_unparseable_claude_json() {
+        let temp = setup_test_env();
+        let path = temp.path().join(".claude.json");
+        // e.g. a hand edit with a trailing comma, or a partial write
+        let original = r#"{"oauthAccount":{"id":"a"},"projects":{},}"#;
+        fs::write(&path, original).unwrap();
+
+        for (source, project) in [
+            ("user_claude_json", None),
+            ("local_claude_json", Some("/tmp/project".to_string())),
+        ] {
+            let result = save_mcp_servers(
+                source.to_string(),
+                r#"{"s":{"command":"c"}}"#.to_string(),
+                project,
+            )
+            .await;
+            assert!(result.is_err(), "{source} should refuse to overwrite");
+            assert!(result.unwrap_err().contains("not valid JSON"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+        drop(temp);
+    }
+
+    #[tokio::test]
+    async fn test_save_mcp_servers_refuses_to_clobber_unparseable_settings_json() {
+        let temp = setup_test_env();
+        let claude_dir = temp.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let path = claude_dir.join("settings.json");
+        let original = r#"{"model":"opus""#;
+        fs::write(&path, original).unwrap();
+
+        let result = save_mcp_servers("user_settings".to_string(), "{}".to_string(), None).await;
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        drop(temp);
+    }
+
+    #[tokio::test]
+    async fn test_save_mcp_servers_accepts_bom_prefixed_claude_json() {
+        let temp = setup_test_env();
+        let path = temp.path().join(".claude.json");
+        fs::write(&path, "\u{feff}{\"oauthAccount\":{\"id\":\"a\"}}").unwrap();
+
+        save_mcp_servers("user_claude_json".to_string(), "{}".to_string(), None)
+            .await
+            .unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["oauthAccount"]["id"], "a");
         drop(temp);
     }
 
