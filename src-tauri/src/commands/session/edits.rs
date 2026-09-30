@@ -67,6 +67,16 @@ struct SessionEditsResult {
     cwd_counts: HashMap<String, usize>,
 }
 
+/// Replay one Edit/MultiEdit step the way the Edit tool applied it:
+/// every occurrence when `replace_all` was set, otherwise the first.
+fn apply_edit(content: &str, old_str: &str, new_str: &str, replace_all: bool) -> String {
+    if replace_all {
+        content.replace(old_str, new_str)
+    } else {
+        content.replacen(old_str, new_str, 1)
+    }
+}
+
 /// Process a single session file and extract edit information
 #[allow(unsafe_code)] // Required for mmap performance optimization
 fn process_session_file_for_edits(file_path: &PathBuf) -> Option<SessionEditsResult> {
@@ -146,7 +156,12 @@ fn process_session_file_for_edits(file_path: &PathBuf) -> Option<SessionEditsRes
                                         edit.get("old_string").and_then(|v| v.as_str()),
                                         edit.get("new_string").and_then(|v| v.as_str()),
                                     ) {
-                                        content = content.replacen(old_str, new_str, 1);
+                                        let replace_all = edit
+                                            .get("replace_all")
+                                            .and_then(serde_json::Value::as_bool)
+                                            .unwrap_or(false);
+                                        content =
+                                            apply_edit(&content, old_str, new_str, replace_all);
                                         lines_removed += old_str.lines().count();
                                         lines_added += new_str.lines().count();
                                     }
@@ -175,7 +190,11 @@ fn process_session_file_for_edits(file_path: &PathBuf) -> Option<SessionEditsRes
                         if let Some(original) =
                             tool_use_result.get("originalFile").and_then(|v| v.as_str())
                         {
-                            let content = original.replacen(old_str, new_str, 1);
+                            let replace_all = tool_use_result
+                                .get("replaceAll")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false);
+                            let content = apply_edit(original, old_str, new_str, replace_all);
 
                             edits.push(RecentFileEdit {
                                 file_path: file_path_str.to_string(),
@@ -1085,6 +1104,70 @@ mod tests {
         let mut file = File::create(&file_path).unwrap();
         file.write_all(content.as_bytes()).unwrap();
         file_path
+    }
+
+    /// `content_after_change` is what Restore writes to disk, so it must match
+    /// what the Edit tool produced. With `replaceAll` / `replace_all` that is
+    /// every occurrence, not just the first.
+    #[test]
+    fn edit_results_honor_replace_all() {
+        let dir = TempDir::new().unwrap();
+        let original = "let foo = 1;\nfoo += foo;\n";
+        let single = serde_json::json!({
+            "uuid": "u1",
+            "sessionId": "s",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "user",
+            "toolUseResult": {
+                "filePath": "/p/a.rs",
+                "oldString": "foo",
+                "newString": "bar",
+                "originalFile": original,
+                "replaceAll": true,
+            }
+        });
+        let multi = serde_json::json!({
+            "uuid": "u2",
+            "sessionId": "s",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "user",
+            "toolUseResult": {
+                "filePath": "/p/b.rs",
+                "originalFile": original,
+                "edits": [
+                    { "old_string": "foo", "new_string": "bar", "replace_all": true },
+                    { "old_string": "1", "new_string": "2" },
+                ],
+            }
+        });
+        let not_all = serde_json::json!({
+            "uuid": "u3",
+            "sessionId": "s",
+            "timestamp": "2026-01-01T00:00:02Z",
+            "type": "user",
+            "toolUseResult": {
+                "filePath": "/p/c.rs",
+                "oldString": "foo",
+                "newString": "bar",
+                "originalFile": original,
+                "replaceAll": false,
+            }
+        });
+        let path =
+            create_test_jsonl_file(&dir, "s.jsonl", &format!("{single}\n{multi}\n{not_all}\n"));
+
+        let result = process_session_file_for_edits(&path).unwrap();
+        let after = |file: &str| {
+            result
+                .edits
+                .iter()
+                .find(|e| e.file_path == file)
+                .map(|e| e.content_after_change.clone())
+                .unwrap()
+        };
+        assert_eq!(after("/p/a.rs"), "let bar = 1;\nbar += bar;\n");
+        assert_eq!(after("/p/b.rs"), "let bar = 2;\nbar += bar;\n");
+        assert_eq!(after("/p/c.rs"), "let bar = 1;\nfoo += foo;\n");
     }
 
     // ------------------------------------------------------------------
