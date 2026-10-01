@@ -145,6 +145,14 @@ Antigravity note: the viewer resolves the Antigravity root as `~/.gemini/antigra
 |---------|-------|
 | **Antigravity** | Loaded through the standard provider pipeline. Sessions come from the token monitor cache and participate in project/session views, token stats, analytics, and global search without a separate UI mode. |
 
+### New in v1.30.0
+
+| Feature | Description |
+|---------|-------------|
+| **WebUI security hardening** | In `--serve` mode, session and project paths are limited to your history folders, and project settings to known projects — upgrade if you run the WebUI ([advisory](https://github.com/jhlee0409/claude-code-history-viewer/security/advisories/GHSA-j5r9-j75x-wprj)) |
+| **Claude Code auto titles** | Sessions show the title Claude Code generated, in the session list, stats, export and archives (your own rename still wins) |
+| **Prompts vs. agent updates** | The Messages panel marks your typed prompts, agent updates, commands and injected context, with a "Show my prompts only" filter |
+
 ### New in v1.29.0
 
 | Feature | Description |
