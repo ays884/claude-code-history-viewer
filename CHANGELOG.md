@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.30.0] - 2026-10-01
+
+### Security
+- **WebUI server mode (`--serve`) hardening** ([GHSA-j5r9-j75x-wprj](https://github.com/jhlee0409/claude-code-history-viewer/security/advisories/GHSA-j5r9-j75x-wprj)). Upgrade if you run the WebUI.
+  - Endpoints that take a session or project path only accept paths under the configured history roots (`~/.claude/projects`, `CLAUDE_CONFIG_DIR`, custom Claude directories, the app archive folder); anything else gets one uniform error. Provider loaders (including Aider and the Cline family) confine path-bearing ids to their own discovery roots. (#617, #620)
+  - Project-scoped settings endpoints and the Board's git log only accept project directories recorded in Claude history. In the WebUI, non-Claude providers no longer get git log or project-scoped settings reads. (#618)
+  - Custom Claude directories are now server configuration: the WebUI can no longer add, change or remove them. Set them from the desktop app, `CLAUDE_CONFIG_DIR`, or the server's `user-data.json`. (#617)
+- **Project settings saves stay inside the project** (desktop and WebUI): a symlinked `.claude` directory or a pre-existing link at the temp-file path is no longer written through. (#618)
+
+### Added
+- **Messages panel row kinds:** typed prompts, agent updates, slash commands and injected context get their own icon, and a "Show my prompts only" filter; tool-result rows no longer show as "(user message)". The panel's text filter matches the visible row kind. (#600, #615)
+- **Claude Code auto-generated session titles** (`ai-title` records) are used for session names, with the priority custom rename › auto title › legacy summary › first message — in the session list, stats, CLI `--export`, and archives (existing archives update on first open). (#601, #611, #616, #622)
+
+### Fixed
+- Codex sessions from models that store reasoning in `content` instead of `summary` (e.g. DeepSeek) now show their reasoning. (#597, #610)
+- Task notifications with `killed`, `stopped` or `error` status render as failed instead of "DONE". (#615)
+- Refreshing (manual, file watcher, sidechain toggle) keeps the open session and its view in place, including subagent views and sessions beyond the first page of the list; a page loaded during a refresh no longer leaves gaps in the list. (#603, #609, #612, #614, #621)
+- Clicking a relative or `file:` link in a transcript no longer navigates the app window away; bare `data:`/`blob:` links are blocked unless they are downloads. (#602, #613)
+- Restoring a file from Recent Edits honors `replace_all` edits. (#606)
+- Renaming or resetting a session name ends the rewritten JSONL with a newline, so Claude Code's next append isn't glued to the last line. (#607)
+- Saving MCP servers refuses to overwrite a config file that fails to parse instead of replacing it with `{}`. (#605)
+- Concurrent metadata saves (session/project metadata, settings) no longer lose updates. (#623)
+- MCP project entries in `~/.claude.json` are keyed by the canonical project path. (#618)
+
 ## [1.29.0] - 2026-09-28
 
 ### Added
