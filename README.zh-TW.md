@@ -145,6 +145,14 @@ Antigravity 說明：檢視器將 Antigravity 根目錄解析為 `~/.gemini/anti
 |---------|-------|
 | **Antigravity** | 透過標準 provider 資料流載入。工作階段來自 token monitor 快取，可直接參與專案/工作階段瀏覽、Token 統計、分析儀表板與全域搜尋，無需另外建立專用 UI 模式。 |
 
+### v1.30.0 新增
+
+| 功能 | 說明 |
+|------|------|
+| **WebUI 安全強化** | `--serve` 模式下，工作階段與專案路徑僅限歷史記錄資料夾，專案設定僅限已知專案 — 若你使用 WebUI，請升級（[安全公告](https://github.com/jhlee0409/claude-code-history-viewer/security/advisories/GHSA-j5r9-j75x-wprj)） |
+| **Claude Code 自動標題** | 工作階段清單、統計、匯出與封存中顯示 Claude Code 產生的標題（你手動設定的名稱優先） |
+| **區分你的提示與代理更新** | Messages 面板會區分你輸入的提示、代理更新、指令與注入的情境，並提供「僅顯示我的提示」篩選 |
+
 ### v1.29.0 新增
 
 | 功能 | 說明 |

@@ -18,8 +18,36 @@ use crate::commands;
 /// Caller-supplied session / project paths must sit under a configured history
 /// root. Applied here, at the HTTP trust boundary, rather than in the commands,
 /// which desktop also calls with paths from its own scans and folder picker.
+///
+/// Filesystem paths only. The default for every handler whose command opens
+/// the value as a path.
 fn require_history_path(path: &str) -> Result<(), String> {
+    commands::session::is_safe_history_file_path(std::path::Path::new(path))
+}
+
+/// Also accepts a provider URI (`scheme://…`). Only for handlers whose command
+/// resolves such ids against its own provider store (#560).
+fn require_history_path_or_provider_uri(path: &str) -> Result<(), String> {
     commands::session::is_safe_session_path(std::path::Path::new(path))
+}
+
+/// Recent edits read a provider project through the provider (its path is a
+/// provider id) and any other project from disk. A session is accepted as a
+/// provider id only when it is one of that same provider's ids; anything else
+/// must be a history file.
+fn require_edits_project(project_path: &str, session: Option<&str>) -> Result<(), String> {
+    if commands::session::is_provider_edits_project(project_path) {
+        require_history_path_or_provider_uri(project_path)?;
+    } else {
+        require_history_path(project_path)?;
+    }
+    match session {
+        Some(s) if commands::session::is_provider_session_of_project(project_path, s) => {
+            require_history_path_or_provider_uri(s)
+        }
+        Some(s) => require_history_path(s),
+        None => Ok(()),
+    }
 }
 
 /// A Claude base directory (`~/.claude`-shaped) is accepted when its
@@ -720,7 +748,8 @@ handler_json!(
     get_session_subagents,
     SessionPathParam,
     |p: SessionPathParam| async move {
-        require_history_path(&p.session_path)?;
+        // OpenCode / Kilo subagents are read by provider id.
+        require_history_path_or_provider_uri(&p.session_path)?;
         commands::session::get_session_subagents(p.session_path).await
     }
 );
@@ -738,10 +767,7 @@ handler_json!(
     get_recent_edits,
     RecentEditsParams,
     |p: RecentEditsParams| async move {
-        require_history_path(&p.project_path)?;
-        if let Some(session) = &p.session_file_path {
-            require_history_path(session)?;
-        }
+        require_edits_project(&p.project_path, p.session_file_path.as_deref())?;
         commands::session::get_recent_edits(
             p.project_path,
             p.offset,
@@ -772,10 +798,7 @@ handler_json!(
     RestoreFileParams,
     |p: RestoreFileParams| async move {
         // The edit history that authorises the write must itself be history.
-        require_history_path(&p.project_path)?;
-        if let Some(session) = &p.session_file_path {
-            require_history_path(session)?;
-        }
+        require_edits_project(&p.project_path, p.session_file_path.as_deref())?;
         commands::session::restore_file(p.file_path, p.content, p.project_path, p.session_file_path)
             .await
     }
@@ -873,7 +896,8 @@ handler_json!(
     rename_opencode_session_title,
     RenameOpenCodeParams,
     |p: RenameOpenCodeParams| async move {
-        require_history_path(&p.session_path)?;
+        // OpenCode sessions are addressed by provider id.
+        require_history_path_or_provider_uri(&p.session_path)?;
         commands::session::rename_opencode_session_title(p.session_path, p.new_title).await
     }
 );
@@ -1246,7 +1270,9 @@ pub async fn load_user_metadata(
         }
     }
 
-    // Load from disk
+    // Load from disk. A load racing a save must not put the pre-save file
+    // back in the cache.
+    let _write = ms.write_lock.lock().await;
     let path = commands::metadata::get_user_data_path().map_err(ApiError::from)?;
     let metadata = tokio::task::spawn_blocking(move || {
         if path.exists() {
@@ -1283,45 +1309,45 @@ pub async fn load_user_metadata(
 /// Ignoring rather than rejecting keeps the frontend, which
 /// always sends the full settings object, able to save everything else. The
 /// cache is updated to what was actually written.
+///
+/// `mutate` is applied to the current metadata under the metadata write lock
+/// (see `commands::metadata::mutate_and_save`), so concurrent saves are
+/// serialized and none is lost.
 async fn save_webui_metadata(
     state: &AppState,
-    mut metadata: crate::models::UserMetadata,
+    mutate: impl FnOnce(&mut crate::models::UserMetadata) + Send + 'static,
 ) -> Result<crate::models::UserMetadata, ApiError> {
-    let saved = tokio::task::spawn_blocking(move || {
-        let incoming = std::mem::take(&mut metadata.settings.custom_claude_paths);
-        let mut kept = commands::metadata::get_user_data_path()
-            .ok()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|content| serde_json::from_str::<crate::models::UserMetadata>(&content).ok())
-            .map(|persisted| persisted.settings.custom_claude_paths)
-            .unwrap_or_default();
-        // `CLAUDE_CONFIG_DIR` is set on the host, so the frontend recording it
-        // (it registers the detected value automatically) adds no new root.
-        let same =
-            |a: &str, b: &str| a.trim_end_matches(['/', '\\']) == b.trim_end_matches(['/', '\\']);
-        if let Some(config_dir) = commands::project::claude_config_dir() {
-            if !kept.iter().any(|c| same(&c.path, &config_dir)) {
-                kept.extend(
-                    incoming
-                        .into_iter()
-                        .filter(|c| same(&c.path, &config_dir))
-                        .take(1),
-                );
-            }
-        }
-        metadata.settings.custom_claude_paths = kept;
-        commands::metadata::save_metadata_to_disk(&metadata).map(|()| metadata)
+    commands::metadata::mutate_and_save(&state.metadata, move |metadata| {
+        mutate(metadata);
+        keep_persisted_custom_claude_paths(metadata);
     })
     .await
-    .map_err(|e| ApiError(format!("Task join error: {e}")))??;
+    .map_err(ApiError::from)
+}
 
-    let mut cached = state
-        .metadata
-        .metadata
-        .lock()
-        .map_err(|e| ApiError(format!("Lock error: {e}")))?;
-    *cached = Some(saved.clone());
-    Ok(saved)
+fn keep_persisted_custom_claude_paths(metadata: &mut crate::models::UserMetadata) {
+    let incoming = std::mem::take(&mut metadata.settings.custom_claude_paths);
+    let mut kept = commands::metadata::get_user_data_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|content| serde_json::from_str::<crate::models::UserMetadata>(&content).ok())
+        .map(|persisted| persisted.settings.custom_claude_paths)
+        .unwrap_or_default();
+    // `CLAUDE_CONFIG_DIR` is set on the host, so the frontend recording it
+    // (it registers the detected value automatically) adds no new root.
+    let same =
+        |a: &str, b: &str| a.trim_end_matches(['/', '\\']) == b.trim_end_matches(['/', '\\']);
+    if let Some(config_dir) = commands::project::claude_config_dir() {
+        if !kept.iter().any(|c| same(&c.path, &config_dir)) {
+            kept.extend(
+                incoming
+                    .into_iter()
+                    .filter(|c| same(&c.path, &config_dir))
+                    .take(1),
+            );
+        }
+    }
+    metadata.settings.custom_claude_paths = kept;
 }
 
 #[derive(Deserialize)]
@@ -1333,7 +1359,7 @@ pub async fn save_user_metadata(
     State(state): State<Arc<AppState>>,
     Json(p): Json<SaveUserMetadataParams>,
 ) -> Result<Json<Value>, ApiError> {
-    save_webui_metadata(&state, p.metadata).await?;
+    save_webui_metadata(&state, move |m| *m = p.metadata).await?;
     Ok(Json(Value::Null))
 }
 
@@ -1341,22 +1367,14 @@ pub async fn update_session_metadata(
     State(state): State<Arc<AppState>>,
     Json(p): Json<UpdateSessionMetadataParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let metadata_to_save = {
-        let mut cached = state
-            .metadata
-            .metadata
-            .lock()
-            .map_err(|e| ApiError(format!("Lock error: {e}")))?;
-        let metadata = cached.get_or_insert_with(crate::models::UserMetadata::new);
+    let metadata_to_save = save_webui_metadata(&state, move |metadata| {
         if p.update.is_empty() {
             metadata.sessions.remove(&p.session_id);
         } else {
             metadata.sessions.insert(p.session_id, p.update);
         }
-        metadata.clone()
-    };
-
-    let metadata_to_save = save_webui_metadata(&state, metadata_to_save).await?;
+    })
+    .await?;
 
     Ok(Json(serde_json::to_value(metadata_to_save).map_err(
         |e| ApiError(format!("Serialization error: {e}")),
@@ -1369,22 +1387,14 @@ pub async fn update_project_metadata(
 ) -> Result<Json<Value>, ApiError> {
     commands::metadata::validate_project_metadata_key(&p.project_path).map_err(ApiError::from)?;
 
-    let metadata_to_save = {
-        let mut cached = state
-            .metadata
-            .metadata
-            .lock()
-            .map_err(|e| ApiError(format!("Lock error: {e}")))?;
-        let metadata = cached.get_or_insert_with(crate::models::UserMetadata::new);
+    let metadata_to_save = save_webui_metadata(&state, move |metadata| {
         if p.update.is_empty() {
             metadata.projects.remove(&p.project_path);
         } else {
             metadata.projects.insert(p.project_path, p.update);
         }
-        metadata.clone()
-    };
-
-    let metadata_to_save = save_webui_metadata(&state, metadata_to_save).await?;
+    })
+    .await?;
 
     Ok(Json(serde_json::to_value(metadata_to_save).map_err(
         |e| ApiError(format!("Serialization error: {e}")),
@@ -1400,19 +1410,8 @@ pub async fn update_user_settings(
     State(state): State<Arc<AppState>>,
     Json(p): Json<UpdateUserSettingsParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let settings = p.settings;
-    let metadata_to_save = {
-        let mut cached = state
-            .metadata
-            .metadata
-            .lock()
-            .map_err(|e| ApiError(format!("Lock error: {e}")))?;
-        let metadata = cached.get_or_insert_with(crate::models::UserMetadata::new);
-        metadata.settings = settings;
-        metadata.clone()
-    };
-
-    let metadata_to_save = save_webui_metadata(&state, metadata_to_save).await?;
+    let metadata_to_save =
+        save_webui_metadata(&state, move |metadata| metadata.settings = p.settings).await?;
 
     Ok(Json(serde_json::to_value(metadata_to_save).map_err(
         |e| ApiError(format!("Serialization error: {e}")),
@@ -1755,6 +1754,45 @@ mod tests {
         let saved = persisted_metadata().settings.custom_claude_paths;
         assert_eq!(saved.len(), 1, "{saved:?}");
         assert_eq!(saved[0].path, config_dir.to_string_lossy());
+    }
+
+    /// Concurrent `WebUI` session updates must all survive on disk and in the
+    /// cache; an older save must not overwrite a newer one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[serial]
+    async fn webui_concurrent_session_updates_are_all_persisted() {
+        const N: usize = 16;
+        let _home = crate::test_utils::SandboxHome::new();
+        let state = metadata_state();
+        let barrier = Arc::new(tokio::sync::Barrier::new(N));
+
+        let tasks: Vec<_> = (0..N)
+            .map(|i| {
+                let (state, barrier) = (Arc::clone(&state), Arc::clone(&barrier));
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    update_session_metadata(
+                        State(state),
+                        Json(UpdateSessionMetadataParams {
+                            session_id: format!("session-{i}"),
+                            update: crate::models::SessionMetadata {
+                                custom_name: Some(format!("name-{i}")),
+                                ..Default::default()
+                            },
+                        }),
+                    )
+                    .await
+                    .is_ok()
+                })
+            })
+            .collect();
+        for t in tasks {
+            assert!(t.await.unwrap(), "update_session_metadata failed");
+        }
+
+        assert_eq!(persisted_metadata().sessions.len(), N, "disk lost updates");
+        let cached = state.metadata.metadata.lock().unwrap().clone().unwrap();
+        assert_eq!(cached.sessions.len(), N, "cache lost updates");
     }
 
     /// Path-bearing provider ids pass the history-root check as ids, so the
@@ -2188,5 +2226,147 @@ mod tests {
             !std::path::Path::new(&cwd).exists(),
             "deleted project dir was recreated"
         );
+    }
+}
+
+/// Which handlers take a provider URI and which take only a filesystem path.
+/// Not `unix`-gated: the values below must be refused on every platform.
+#[cfg(test)]
+mod provider_uri_scope_tests {
+    use super::*;
+    use serial_test::serial;
+
+    const OUTSIDE: &str = commands::session::OUTSIDE_HISTORY_ROOTS;
+
+    /// URI-shaped values that are not history files.
+    const NOT_FILESYSTEM_HISTORY: [&str; 3] = [
+        "c://cchv-none/a/b.jsonl",
+        "x://cchv-none/a/b.jsonl",
+        "opencode://proj-1/ses_abc123",
+    ];
+
+    fn error_of(res: Result<Json<Value>, ApiError>) -> Option<String> {
+        res.err().map(|e| e.0)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn claude_session_handlers_take_only_filesystem_paths() {
+        let _home = crate::test_utils::SandboxHome::new();
+        for value in NOT_FILESYSTEM_HISTORY {
+            let res = load_session_messages(Json(SessionPathParam {
+                session_path: value.to_string(),
+            }))
+            .await;
+            assert_eq!(error_of(res).as_deref(), Some(OUTSIDE), "{value}");
+
+            let res = load_provider_messages(Json(ProviderMessagesParams {
+                provider: "claude".to_string(),
+                session_path: value.to_string(),
+            }))
+            .await;
+            assert_eq!(error_of(res).as_deref(), Some(OUTSIDE), "{value}");
+
+            let res = delete_session(Json(DeleteSessionParams {
+                file_path: value.to_string(),
+            }))
+            .await;
+            assert_eq!(error_of(res).as_deref(), Some(OUTSIDE), "{value}");
+        }
+    }
+
+    /// A project the recent-edits panel does not route to a provider is read
+    /// from disk, so it must be a history path.
+    #[tokio::test]
+    #[serial]
+    async fn recent_edits_take_a_uri_only_for_provider_projects() {
+        let _home = crate::test_utils::SandboxHome::new();
+        let res = get_recent_edits(Json(RecentEditsParams {
+            project_path: "zz://cchv-none/proj".to_string(),
+            offset: None,
+            limit: None,
+            session_file_path: None,
+            grouping: None,
+        }))
+        .await;
+        assert_eq!(error_of(res).as_deref(), Some(OUTSIDE));
+
+        let res = get_recent_edits(Json(RecentEditsParams {
+            project_path: "opencode://cchv-none-proj".to_string(),
+            offset: None,
+            limit: None,
+            session_file_path: Some("opencode://cchv-none-proj/ses_1".to_string()),
+            grouping: None,
+        }))
+        .await;
+        assert_ne!(error_of(res).as_deref(), Some(OUTSIDE));
+    }
+
+    /// A session inside a provider project is either that provider's own id
+    /// or a history file; another scheme is neither.
+    #[tokio::test]
+    #[serial]
+    async fn recent_edits_session_must_belong_to_the_project_provider() {
+        let _home = crate::test_utils::SandboxHome::new();
+        for session in ["zz://cchv-none/a/b.jsonl", "kilo://cchv-none-proj/ses_1"] {
+            let res = get_recent_edits(Json(RecentEditsParams {
+                project_path: "opencode://cchv-none-proj".to_string(),
+                offset: None,
+                limit: None,
+                session_file_path: Some(session.to_string()),
+                grouping: None,
+            }))
+            .await;
+            assert_eq!(error_of(res).as_deref(), Some(OUTSIDE), "{session}");
+        }
+    }
+
+    /// Codex projects are provider ids, but their sessions are rollout files.
+    #[tokio::test]
+    #[serial]
+    async fn recent_edits_accept_a_codex_rollout_file_as_the_session() {
+        let home = crate::test_utils::SandboxHome::new();
+        let day = home.path().join(".codex").join("sessions").join("2026");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-cchv.jsonl");
+        std::fs::write(&rollout, "").unwrap();
+
+        let res = get_recent_edits(Json(RecentEditsParams {
+            project_path: "codex://cchv-none-proj".to_string(),
+            offset: None,
+            limit: None,
+            session_file_path: Some(rollout.to_string_lossy().to_string()),
+            grouping: None,
+        }))
+        .await;
+        assert_ne!(error_of(res).as_deref(), Some(OUTSIDE));
+    }
+
+    /// Handlers whose commands resolve database-backed provider ids keep
+    /// accepting them (#560).
+    #[tokio::test]
+    #[serial]
+    async fn provider_uri_handlers_still_accept_provider_ids() {
+        let _home = crate::test_utils::SandboxHome::new();
+        for value in ["opencode://proj-1/ses_abc123", "kilo://proj-1/ses_abc123"] {
+            let res = get_session_subagents(Json(SessionPathParam {
+                session_path: value.to_string(),
+            }))
+            .await;
+            assert_ne!(error_of(res).as_deref(), Some(OUTSIDE), "{value}");
+        }
+
+        let res = rename_opencode_session_title(Json(RenameOpenCodeParams {
+            session_path: "opencode://proj-1/ses_abc123".to_string(),
+            new_title: "t".to_string(),
+        }))
+        .await;
+        assert_ne!(error_of(res).as_deref(), Some(OUTSIDE));
+
+        let res = get_session_subagents(Json(SessionPathParam {
+            session_path: "c://cchv-none/a/b.jsonl".to_string(),
+        }))
+        .await;
+        assert_eq!(error_of(res).as_deref(), Some(OUTSIDE));
     }
 }

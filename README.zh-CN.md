@@ -145,6 +145,14 @@ Antigravity 说明：查看器将 Antigravity 根目录解析为 `~/.gemini/anti
 |---------|-------|
 | **Antigravity** | 走现有统一 provider 数据流接入。会话来自 token monitor 缓存，可直接参与项目/会话浏览、Token 统计、分析仪表板和全局搜索，无需单独的专用页面。 |
 
+### v1.30.0 新增
+
+| 功能 | 说明 |
+|------|------|
+| **WebUI 安全加固** | `--serve` 模式下，会话和项目路径仅限历史记录目录，项目设置仅限已知项目 — 如果你在使用 WebUI，请升级（[安全公告](https://github.com/jhlee0409/claude-code-history-viewer/security/advisories/GHSA-j5r9-j75x-wprj)） |
+| **Claude Code 自动标题** | 会话列表、统计、导出和归档中显示 Claude Code 生成的标题（你手动设置的名称优先） |
+| **区分你的提示与代理更新** | Messages 面板会区分你输入的提示、代理更新、命令和注入的上下文，并提供“仅显示我的提示”筛选 |
+
 ### v1.29.0 新增
 
 | 功能 | 说明 |
